@@ -1,49 +1,310 @@
 # High
 
-### [H-1] `TSwapPool::getInputAmountBasedOnOutput()` calculates pool fee as a wrong value, thereby taking more tokens than intended from caller
+## [H-1] `TSwapPool::getInputAmountBasedOnOutput()` calculates pool fee as a wrong value, thereby taking more tokens than intended from caller
 
 **Description:** 
 
-**Impact:** 
+`TSwapPool::swapExactOutput` calls `TSwapPool::getInputAmountBasedOnOutput` to get input amount to supply based on output amount expected, but the function `getInputAmountBasedOnOutput` calculate fee with an error. The actual fee expected by the protocol is 0.3% of the swap amount requested. But, this function is calculating fee as 90.3% of the swap thereby taking away more amount than user expects.
+
+**Impact:**
+user loses 90% more tokens as fee than what protocol says i.e., 0.3% thereby user lose of funds for user.
 
 **Proof of Concept:**
 
+Place below code in `Tswap.t.sol` and run `forge test --mt testswapExactOutputIsWrong`
+
+```javascript
+    function testswapExactOutputIsWrong() public {
+        vm.startPrank(liquidityProvider);
+        weth.approve(address(pool), 100e18);
+        poolToken.approve(address(pool), 100e18);
+        pool.deposit(100e18, 100e18, 100e18, uint64(block.timestamp));
+        vm.stopPrank();
+
+        address user1 = makeAddr("user1");
+        poolToken.mint(user1, 100e18);
+
+        vm.startPrank(user1);
+        poolToken.approve(address(pool), 100e18);
+
+        // what is 0.3% of 1e18 = 3e15
+        // so, we need to pay tokenA of 1e18 + 3e15 = 1.003e18 in exchange of 1 weth
+        // user1 starts with balance of 100e18. so, after swap, user balance must be -
+        // 100e18 - 1.003e18 = 98.997e18
+
+        pool.swapExactOutput(poolToken, weth, 1e18, uint64(block.timestamp));
+
+        // so expected is - 98.997e18, lets see what we got -
+        console.log(poolToken.balanceOf(user1));
+
+        // user1 must have greater than 98e18 atleast, but he has less than that -
+        assertFalse(poolToken.balanceOf(user1) > 98e18);
+    }
+```
+
 **Recommended Mitigation:** 
 
+Make below code changes in `TSwapPool.sol`
 
-### [H-2] `TSwapPool::_swap()` function is giving away extra tokens of 1 ether for every 10 swaps, breaking system's invariant property
+```diff
+    function getInputAmountBasedOnOutput(
+        ...
+    )
+        ...
+    {
+-        return ((inputReserves * outputAmount) * 10000) / ((outputReserves - outputAmount) * 997);
++        return ((inputReserves * outputAmount) * 1000) / ((outputReserves - outputAmount) * 997);
+
+    }
+``` 
+
+
+## [H-2] `TSwapPool::_swap()` is giving away extra tokens, breaking system's invariant property
+
+**Description:**
+for every 10 swaps, there is an additional transfer of 1 ether to the swapper hence, the protocol invariant breaks
+
+**Impact:**
+protocol breaks and becomes unusable if invariant breaks.
+
+**Proof of Concept:**
+
+<details>
+<summary> code </summary>
+
+Place below code in `test/invariants/Invariant.t.sol`
+
+```javascript
+// SPDX-License-Identifier: MIT
+
+pragma solidity 0.8.20;
+
+import { Test, StdInvariant } from "forge-std/Test.sol";
+
+import { TSwapPool } from "../../src/TSwapPool.sol";
+import { PoolFactory } from "../../src/PoolFactory.sol";
+import { ERC20Mock } from "@openzeppelin/contracts/mocks/token/ERC20Mock.sol";
+import { Handler } from "./Handler.sol";
+
+contract Invariant is StdInvariant, Test {
+    TSwapPool public pool;
+    PoolFactory public factory;
+    ERC20Mock public token;
+    ERC20Mock public weth;
+    Handler public handler;
+
+    address liquidityProvider = makeAddr("liquidityProvider");
+
+    uint256 public STARTING_WETH = 100 ether;
+    uint256 public STARTING_TOKEN = 50 ether;
+
+    function setUp() public {
+        factory = new PoolFactory(address(weth));
+
+        weth = new ERC20Mock();
+        token = new ERC20Mock();
+
+        pool = TSwapPool(factory.createPool(address(token)));
+
+        vm.startPrank(liquidityProvider);
+        weth.mint(liquidityProvider, STARTING_WETH);
+        token.mint(liquidityProvider, STARTING_TOKEN);
+        pool.deposit(STARTING_WETH, STARTING_WETH, STARTING_TOKEN, uint64(block.timestamp));
+
+        handler = new Handler(address(pool), address(weth), address(token));
+
+        bytes4[] memory selectors = new bytes4[](2);
+        selectors[0] = handler.deposit.selector;
+        selectors[1] = handler.swap.selector;
+
+        targetSelector(FuzzSelector({ addr: address(handler), selectors: selectors }));
+        targetContract(address(handler));
+    }
+
+    function stateful_InvariantX() public view {
+        assertEq(handler.actualDeltaWeth(), handler.expectedDeltaWeth());
+    }
+
+    function stateful_InvariantY() public view {
+        assertEq(handler.actualDeltaToken(), handler.expectedDeltaToken());
+    }
+}
+
+```
+
+Place below code in `test/invariants/Handler.sol`
+
+```javascript
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.20;
+
+import { Test } from "forge-std/Test.sol";
+
+import { TSwapPool } from "../../src/TSwapPool.sol";
+import { ERC20Mock } from "@openzeppelin/contracts/mocks/token/ERC20Mock.sol";
+
+contract Handler is Test {
+    TSwapPool public pool;
+    ERC20Mock public weth;
+    ERC20Mock public token;
+
+    address liquidityProvider = makeAddr("liquidityProvider");
+    address user = makeAddr("user");
+
+    uint256 public actualDeltaWeth;
+    uint256 public actualDeltaToken;
+
+    uint256 public expectedDeltaWeth;
+    uint256 public expectedDeltaToken;
+
+    uint256 startingWeth;
+    uint256 startingToken;
+
+    constructor(address _tswapPool, address _weth, address _token) {
+        pool = TSwapPool(_tswapPool);
+        weth = ERC20Mock(_weth);
+        token = ERC20Mock(_token);
+    }
+
+    function deposit(uint256 wethToDeposit) public {
+        bound(wethToDeposit, pool.getMinimumWethDepositAmount(), type(uint64).max);
+        uint256 poolTokenToDeposit = pool.getPoolTokensToDepositBasedOnWeth(wethToDeposit);
+
+        startingWeth = weth.balanceOf(address(pool));
+        startingToken = token.balanceOf(address(pool));
+
+        expectedDeltaToken = poolTokenToDeposit;
+        expectedDeltaWeth = wethToDeposit;
+
+        vm.startPrank(liquidityProvider);
+        weth.mint(liquidityProvider, wethToDeposit);
+        token.mint(liquidityProvider, poolTokenToDeposit);
+
+        weth.approve(address(pool), wethToDeposit);
+        token.approve(address(pool), poolTokenToDeposit);
+
+        pool.deposit(wethToDeposit, 0, poolTokenToDeposit, uint64(block.timestamp));
+        vm.stopPrank();
+
+        actualDeltaWeth = weth.balanceOf(address(pool)) - startingWeth;
+        actualDeltaToken = token.balanceOf(address(pool)) - startingToken;
+    }
+
+    function swap(uint256 outputWethAmount) public {
+        bound(outputWethAmount, 0, weth.balanceOf(address(pool)));
+        uint256 inputTokenAmount = pool.getInputAmountBasedOnOutput(
+            outputWethAmount, token.balanceOf(address(pool)), weth.balanceOf(address(pool))
+        );
+
+        startingWeth = weth.balanceOf(address(pool));
+        startingToken = token.balanceOf(address(pool));
+
+        expectedDeltaWeth = weth.balanceOf(address(pool)) - outputWethAmount;
+        expectedDeltaToken = token.balanceOf(address(pool)) + inputTokenAmount;
+
+        vm.prank(user);
+        token.mint(user, inputTokenAmount);
+        token.approve(address(pool), inputTokenAmount);
+        pool.swapExactOutput(token, weth, outputWethAmount, uint64(block.timestamp));
+        vm.stopPrank();
+
+        actualDeltaWeth = weth.balanceOf(address(pool)) - startingWeth;
+        actualDeltaToken = token.balanceOf(address(pool)) - startingToken;
+    }
+}
+
+```
+
+Now run `forge test --mt stateful_InvariantX` and `forge test --mt stateful_InvariantY` to see if invariant breaks or no.
+
+</details>
+
+**Recommended Mitigation:** 
+
+Make below code changes in `TSwapPool.sol`
+
+```diff
+    function _swap(
+        ...
+    ) private {
+        ...
+
+-       swap_count++;
+-       if (swap_count >= SWAP_COUNT_MAX) {
+-           swap_count = 0;
+-           outputToken.safeTransfer(msg.sender, 1_000_000_000_000_000_000);
+-       }
+
+        emit Swap(msg.sender, inputToken, inputAmount, outputToken, outputAmount);
+
+        inputToken.safeTransferFrom(msg.sender, address(this), inputAmount);
+        outputToken.safeTransfer(msg.sender, outputAmount);
+    }
+```
+
+## [H-3] `sellPoolTokens` is calculating w.r.to output instead of input
 
 **Description:** 
+`TSwapPoolTokens:sellPoolTokens()` is called by user expecting protocol to give him weth by taking in his pool tokens i.e., he is trying to see pool tokens. instead, the `sellPoolTokens` is calling `swapExactOutput()` instead of `swapExactInput` considering user is inputing exact input tokens he wants to sell.
 
-**Impact:** 
-
-**Proof of Concept:**
+Also, the function should have a slippage protection additionally to protect user's from MEV attacks or any inflationary/deflationary attacks to help user get the value what he's expecting to get.
 
 **Recommended Mitigation:** 
 
-### [H-3] `sellPoolTokens` is calculating output instead of input .....??
+Make below code changes in `TSwapPool.sol`
+
+```diff
+
+    function sellPoolTokens(
+        uint256 poolTokenAmount
+    ) external returns (uint256 wethAmount) {
+        return
+-            swapExactOutput(...);
++            swapExactInput(...);
+    }
+
+```
+
+## [H-4] `TSwapPool::swapExactOutput()` function is missing slippage protection check, causing caller to get less tokens than they expect
 
 **Description:** 
+`TSwapPool::swapExactOutput` function doesn't have a slippage protection check to help users get the value that they are expecting to get in return of swap. 
+
+Not having the check will let user submit a transaction without knowing what he's expecting to get out of the pool hence, an attacker or MEV bot who sees the transaction may place an order just before the swapper to manipulate the pool or even a big whale may place an order that changes the value of pool immensely thereby swapper getting the less tokens than he intended to get.
 
 **Impact:** 
-
-**Proof of Concept:**
+pool takes in more tokens than what user want to spend for the output he places the order for.
 
 **Recommended Mitigation:** 
 
-### [H-4] `TSwapPool::swapExactOutput()` function is missing slippage protection check, causing caller to get less tokens than they expect
+```diff
+    function swapExactOutput(
+        IERC20 inputToken,
++       uint256 maxInputTokens
+        IERC20 outputToken,
+        uint256 outputAmount,
+        uint64 deadline
+    )
+        ...
+    {
+        uint256 inputReserves = inputToken.balanceOf(address(this));
+        uint256 outputReserves = outputToken.balanceOf(address(this));
 
-**Description:** 
+        inputAmount = getInputAmountBasedOnOutput(
+            outputAmount,
+            inputReserves,
+            outputReserves
+        );
 
-**Impact:** 
++       if(inputAmount > maxInputTokens){
++           revert TSwapPool__InputTooLow(inputAmount, maxInputTokens);
+        }
 
-**Proof of Concept:**
+        _swap(inputToken, inputAmount, outputToken, outputAmount);
+    }
+```
 
-**Recommended Mitigation:** 
-
-# Medium
-
-### [M-1] `TSwapPool::deposit()` doesn't take `deadline` parameter into consideration, causing depositors to get unexpected lp token value for their deposit
+## [H-5] `TSwapPool::deposit()` doesn't take `deadline` parameter into consideration, causing depositors to get unexpected lp token value for their deposit
 
 **Description:** 
 1. When user expects a `deposit` transaction to be executed before an x block.timestamp by passing the deadline to get his expected price of lp token from the pool, there is a possibility that tx can be executed at later point after deadline expires hence provising depositor with a lp token of value that he didn't expect.
@@ -84,23 +345,32 @@ Make below code changes in `TSwapPool.sol`
     {
         ...
         
-    }
+    
 
 ```
 
-### [M-2] Rebase, fee-on-transfer, ERC777, and centralized ERC20s can break core invariant
+# Medium
+
+
+## [M-1] weird-ERC20, ERC777 can break protocol invariant
 
 **Description:** 
+1. `ERC777` will have hooks that execute before and after a transaction. This might cause some intended behavior to happen.
+2. `weird-erc20` - for eg., `USDT` is weird during transfers, not providing a return value for transaction status.
+3. `USDC` is centralized and is a proxy contract, so there can be possibility of `Circle` saying they charge a fee of `x%` on transfers, which will break the protocol invariant.
 
-**Impact:** 
-
-**Proof of Concept:**
+**Impact:**
+breaks protocol invariant, hence protocol becomes unusable.
 
 **Recommended Mitigation:** 
 
+1. restricting weird erc20's thats potential risk to the protocol or only allow allowlisted erc20's to be traded.
+2. Follow `FREI-PI/CEI` design pattern to revert any transaction that is breaking the invariant to always maintain the property.
+3. use at your own risk.
+
 # Low
 
-### [L-1] `PoolFactory()::constructor()` must have a zero check, to avoid pool creation with `address(0)`
+## [L-1] `PoolFactory()::constructor()` must have a zero check, to avoid pool creation with `address(0)`
 
 **Description:** 
 PoolFactory contract can be deployed with weth address as `0x0`. so, all the TSwapPool's will be created with zero address hence failing the protocol.
@@ -126,7 +396,7 @@ Place below code in `PoolFactoryTest.t.sol` and run - `forge test --mt testZeroW
     }
 ```
 
-### [L-2] Incorrect parameter logs in `TSwapPool::LiquidityAdded` event
+## [L-2] Incorrect parameter logs in `TSwapPool::LiquidityAdded` event
 
 **Description:** 
 
@@ -174,7 +444,7 @@ Make below code changes in `PoolFactory.sol`
 
 ```
 
-### [L-3] `swapExactInput` doesn't return expected `output` value
+## [L-3] `swapExactInput` doesn't return expected `output` value
 
 **Description:** 
 `swapExactInput` is expected to return correct calculated `output` value, instead it just returns the 0 value without it being assigned anywhere in the function call hence causing callers to believe output is 0.
@@ -204,7 +474,7 @@ Make below code changes in `TSwap.sol`
 
 # Informational/ Non-critical
 
-### [I-1] Test Coverage
+## [I-1] Test Coverage
 
 **Description:** 
 The current test coverage for the project is below 90%, indicating that several parts of the codebase are not adequately tested.
@@ -243,7 +513,7 @@ By systematically addressing these areas, the test coverage can be improved, lea
 
 ---
 
-### [I-2] `public` functions not used internally could be marked `external`
+## [I-2] `public` functions not used internally could be marked `external`
 
 **Description:** 
 Instead of marking a function as `public`, consider marking it as `external` if it is not used internally.
@@ -268,7 +538,7 @@ Update the visibility of functions that are not used internally to `external`.
 
 ---
 
-### [I-3] Define and use `constant` variables instead of using literals
+## [I-3] Define and use `constant` variables instead of using literals
 
 **Description:** 
 If the same constant literal value is used multiple times, create a constant state variable and reference it throughout the contract.
@@ -311,7 +581,7 @@ Define and use constant variables for repeated literals.
 
 ---
 
-### [I-4] Event is missing `indexed` fields
+## [I-4] Event is missing `indexed` fields
 
 **Description:** 
 Index event fields make the field more quickly accessible to off-chain tools that parse events.
@@ -354,7 +624,7 @@ Add `indexed` to event fields where applicable.
 
 ---
 
-### [I-5] PUSH0 is not supported by all chains
+## [I-5] PUSH0 is not supported by all chains
 
 **Description:** 
 Solc compiler version 0.8.20 switches the default target EVM version to Shanghai, which means that the generated bytecode will include PUSH0 opcodes. Ensure compatibility with deployment chains.
@@ -385,7 +655,7 @@ Select an appropriate EVM version for compatibility with intended deployment cha
 
 ---
 
-### [I-6] Large literal values multiples of 10000 can be replaced with scientific notation
+## [I-6] Large literal values multiples of 10000 can be replaced with scientific notation
 
 **Description:** 
 Use `e` notation for large literal values to improve code readability.
@@ -422,7 +692,7 @@ Replace large literal values with scientific notation.
 
 ---
 
-### [I-7] Unused Custom Error
+## [I-7] Unused Custom Error
 
 **Description:** 
 An unused custom error is defined in the code. 
@@ -445,7 +715,7 @@ Unused custom errors add unnecessary bloat to the code and can be removed for cl
 **Recommended Mitigation:** 
 Remove unused custom error definitions.
 
-### [I-8] Follow CEI
+## [I-8] Follow CEI
 
 **Description:** 
 
