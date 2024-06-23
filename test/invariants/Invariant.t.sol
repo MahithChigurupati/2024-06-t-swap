@@ -9,8 +9,6 @@ import { PoolFactory } from "../../src/PoolFactory.sol";
 import { ERC20Mock } from "@openzeppelin/contracts/mocks/token/ERC20Mock.sol";
 import { Handler } from "./Handler.sol";
 
-import { Handler } from "./Handler.sol";
-
 contract Invariant is StdInvariant, Test {
     TSwapPool public pool;
     PoolFactory public factory;
